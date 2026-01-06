@@ -159,69 +159,81 @@ def fetch_stock_news(tickers):
 # ==========================================
 
 def judge_news_with_gemini(news_list):
-    """ニュースリストをAIに渡し、本当に重要なものだけをフィルタリングする"""
+    """
+    案1(抽出) + 案2(悪材料特化) の実装
+    - GOODニュース: AIを通さずそのまま採用（API節約）
+    - BADニュース: AIにリストを渡し、致命的なものだけ「抽出」させる（一括処理）
+    """
     if not news_list:
         return [], []
 
+    # --- 案2: 悪材料特化 ---
+    # Python側で先に仕分け。好材料はAIに通さず即確定させる。
+    potential_bad_news = [n for n in news_list if n['type'] == 'BAD']
+    confirmed_good_news = [n for n in news_list if n['type'] == 'GOOD'] 
+
+    if not potential_bad_news:
+        # 悪材料候補がなければAI起動不要
+        return [], confirmed_good_news
+
     genai.configure(api_key=GEMINI_API_KEY)
-    
-    # モデル更新: Gemini 2.5 Flash
-    # 高速かつバランスの取れた最新モデル
     model = genai.GenerativeModel('gemini-2.5-flash')
     
-    bad_news_confirmed = []
-    good_news_confirmed = []
+    confirmed_bad_news = []
 
-    # AIへのリクエスト作成（バッチ処理）
-    chunk_size = 10
-    for i in range(0, len(news_list), chunk_size):
-        chunk = news_list[i:i + chunk_size]
+    # --- 案1: 抽出方式 (Extraction) ---
+    # リクエスト回数を減らすため、大きなチャンクでまとめて送る
+    chunk_size = 30  # 30件ずつ処理 (抽出タスクなので多めでもOK)
+    
+    for i in range(0, len(potential_bad_news), chunk_size):
+        chunk = potential_bad_news[i:i + chunk_size]
         
-        prompt = "あなたはプロの機関投資家です。以下の日本株ニュースについて判定してください。\n\n"
+        # ニュースリストをテキスト化
+        news_text = ""
         for idx, news in enumerate(chunk):
-            prompt += f"No.{idx} [銘柄:{news['ticker']}] タイトル: {news['title']}\n"
+            news_text += f"ID:{idx} [銘柄:{news['ticker']}] {news['title']}\n"
         
-        prompt += """
-        \n【指示】
-        各ニュースについて、以下の基準で判定し、結果のみを回答してください。
-        
-        ・株価が暴落する致命的な悪材料なら「BAD」
-        ・株価が暴騰する強い好材料（福音）なら「GOOD」
-        ・どちらでもない、または影響が軽微なら「IGNORE」
-        
-        回答フォーマット:
-        No.0: BAD
-        No.1: IGNORE
-        ...
+        prompt = f"""
+        あなたはプロの機関投資家です。
+        以下の「悪材料候補ニュース」の中から、株価暴落につながる**致命的な悪材料**のIDのみを抽出してください。
+
+        【ニュースリスト】
+        {news_text}
+
+        【指示】
+        - 決算の赤字転落、下方修正、不祥事、訴訟など、インパクトが大きいものを選んでください。
+        - 軽微な減益や、よくある定型的なマイナスニュースは無視してください。
+        - **該当するニュースのID（整数）をJSONのリスト形式**で回答してください。該当なしの場合は空リスト [] を返してください。
+
+        出力例:
+        [0, 2, 5]
         """
         
         try:
             response = model.generate_content(prompt)
-            lines = response.text.strip().split('\n')
+            text = response.text.strip()
             
-            for line in lines:
-                if "BAD" in line:
-                    parts = line.split(':')
-                    if len(parts) > 0:
-                        idx_str = parts[0].replace('No.', '').strip()
-                        if idx_str.isdigit():
-                            idx = int(idx_str)
-                            if idx < len(chunk):
-                                bad_news_confirmed.append(chunk[idx])
-                elif "GOOD" in line:
-                    parts = line.split(':')
-                    if len(parts) > 0:
-                        idx_str = parts[0].replace('No.', '').strip()
-                        if idx_str.isdigit():
-                            idx = int(idx_str)
-                            if idx < len(chunk):
-                                good_news_confirmed.append(chunk[idx])
-                        
+            # Markdown記法除去
+            if text.startswith("```"):
+                text = text.replace("```json", "").replace("```", "").strip()
+
+            # JSONパース
+            target_indices = json.loads(text)
+            
+            # 返ってきたインデックスを実データにマッピング
+            if isinstance(target_indices, list):
+                for idx in target_indices:
+                    if isinstance(idx, int) and 0 <= idx < len(chunk):
+                        confirmed_bad_news.append(chunk[idx])
+            
+            # レート制限対策の待機 (リクエスト回数は激減するが一応入れる)
+            time.sleep(2)
+                    
         except Exception as e:
-            print(f"AI API Error: {e}")
+            print(f"AI API Error (Extraction): {e}")
             continue
 
-    return bad_news_confirmed, good_news_confirmed
+    return confirmed_bad_news, confirmed_good_news
 
 # ==========================================
 # 5. メール送信 (Mail Handler)
